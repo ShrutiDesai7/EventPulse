@@ -1,0 +1,1 @@
+`AuthContext.tsx` owns Cognito session restoration, the current user identity and role, sign-in, and sign-out state. Claims are read from the Cognito-issued ID token through Amplify Auth. Admin membership is determined only by the `cognito:groups` claim.

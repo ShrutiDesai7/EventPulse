@@ -1,0 +1,1 @@
+`authService.ts` and `cognitoConfig.ts` implement Cognito authentication with AWS Amplify Auth. `api.ts` attaches Amplify access tokens for protected calls and normalizes API errors; `eventService.ts` implements the current event-list/detail/create/update/cancel routes. Registration and notification API services remain for later phases.

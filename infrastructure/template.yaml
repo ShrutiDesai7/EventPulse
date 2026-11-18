@@ -1,0 +1,339 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: EventPulse Step 2 serverless API, identity, notifications, and reminders.
+Parameters:
+  SesSenderEmail:
+    Type: String
+    Description: Verified SES sender address for the selected AWS region.
+  FrontendOrigin:
+    Type: String
+    Default: http://localhost:5173
+    Description: Browser origin allowed by the HTTP API CORS policy; override for the deployed frontend.
+  ScheduleGroupName:
+    Type: String
+    Default: eventpulse-reminders
+Globals:
+  Function:
+    Runtime: java21
+    MemorySize: 512
+    Timeout: 20
+    CodeUri: ../backend
+    Environment:
+      Variables:
+        EVENTS_TABLE: !Ref EventsTable
+        REGISTRATIONS_TABLE: !Ref RegistrationsTable
+        USERS_TABLE: !Ref UsersTable
+        NOTIFICATIONS_TABLE: !Ref NotificationsTable
+        SES_SENDER_EMAIL: !Ref SesSenderEmail
+        SES_CONFIGURATION_SET: !Ref SesConfigurationSet
+Resources:
+  EventsApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      Auth:
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience: [!Ref UserPoolClient]
+        DefaultAuthorizer: CognitoJwtAuthorizer
+      CorsConfiguration:
+        AllowOrigins: [!Ref FrontendOrigin]
+        AllowHeaders: [content-type, authorization]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+  EventFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: EventLogGroup
+    Properties:
+      FunctionName: eventpulse-events
+      Handler: com.eventpulse.handler.EventHandler::handleRequest
+      Environment:
+        Variables:
+          SCHEDULE_GROUP_NAME: !Ref ScheduleGroup
+          SCHEDULER_EXECUTION_ROLE_ARN: !GetAtt SchedulerExecutionRole.Arn
+          REMINDER_FUNCTION_ARN: !GetAtt ReminderFunction.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [logs:CreateLogStream, logs:PutLogEvents]
+              Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eventpulse-events:*"
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Scan]
+              Resource: !GetAtt EventsTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:Query]
+              Resource:
+                - !Sub "${RegistrationsTable.Arn}/index/userId-index"
+                - !Sub "${RegistrationsTable.Arn}/index/eventId-index"
+            - Effect: Allow
+              Action: [dynamodb:PutItem]
+              Resource: !GetAtt RegistrationsTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt UsersTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt NotificationsTable.Arn
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail]
+              Resource: '*'
+              Condition: { StringEquals: { ses:FromAddress: !Ref SesSenderEmail } }
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [scheduler:GetSchedule, scheduler:CreateSchedule, scheduler:UpdateSchedule, scheduler:DeleteSchedule]
+              Resource: !Sub "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ScheduleGroup}/ep-*"
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [iam:PassRole]
+              Resource: !GetAtt SchedulerExecutionRole.Arn
+              Condition: { StringEquals: { iam:PassedToService: scheduler.amazonaws.com } }
+      Events:
+        ListEvents:
+          Type: HttpApi
+          Properties: { ApiId: !Ref EventsApi, Path: /events, Method: GET, Auth: { Authorizer: NONE } }
+        AdminDashboard: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: /admin/dashboard, Method: GET } }
+        CreateEvent: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: /events, Method: POST } }
+        ReadEvent:
+          Type: HttpApi
+          Properties: { ApiId: !Ref EventsApi, Path: '/events/{eventId}', Method: GET, Auth: { Authorizer: NONE } }
+        UpdateEvent: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: '/events/{eventId}', Method: PUT } }
+        CancelEvent: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: '/events/{eventId}', Method: DELETE } }
+        Register: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: '/events/{eventId}/registrations', Method: POST } }
+        EventRegistrations: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: '/events/{eventId}/registrations', Method: GET } }
+        AnnounceEvent: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: '/events/{eventId}/announcements', Method: POST } }
+        ReconcileEventSchedules: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: '/events/{eventId}/schedule-reconciliation', Method: POST } }
+  RegistrationFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: RegistrationLogGroup
+    Properties:
+      FunctionName: eventpulse-registrations
+      Handler: com.eventpulse.handler.RegistrationHandler::handleRequest
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [logs:CreateLogStream, logs:PutLogEvents]
+              Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eventpulse-registrations:*"
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt RegistrationsTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem]
+              Resource: !GetAtt EventsTable.Arn
+      Events:
+        CancelRegistration: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: '/registrations/{registrationId}', Method: DELETE } }
+  UserFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: UserLogGroup
+    Properties:
+      FunctionName: eventpulse-users
+      Handler: com.eventpulse.handler.UserHandler::handleRequest
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [logs:CreateLogStream, logs:PutLogEvents]
+              Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eventpulse-users:*"
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt UsersTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:Query]
+              Resource: !Sub "${RegistrationsTable.Arn}/index/userId-index"
+      Events:
+        CurrentUser: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: /users/me, Method: GET } }
+        MyRegistrations: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: /users/me/registrations, Method: GET } }
+  NotificationFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: NotificationLogGroup
+    Properties:
+      FunctionName: eventpulse-notifications
+      Handler: com.eventpulse.handler.NotificationHandler::handleRequest
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [logs:CreateLogStream, logs:PutLogEvents]
+              Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eventpulse-notifications:*"
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:Query]
+              Resource:
+                - !GetAtt NotificationsTable.Arn
+                - !Sub "${NotificationsTable.Arn}/index/userId-createdAt-index"
+      Events:
+        NotificationHistory: { Type: HttpApi, Properties: { ApiId: !Ref EventsApi, Path: /users/me/notifications, Method: GET } }
+  ReminderFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ReminderLogGroup
+    Properties:
+      FunctionName: eventpulse-reminders
+      Handler: com.eventpulse.handler.ReminderHandler::handleRequest
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [logs:CreateLogStream, logs:PutLogEvents]
+              Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eventpulse-reminders:*"
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem]
+              Resource: !GetAtt EventsTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:Query]
+              Resource: !Sub "${RegistrationsTable.Arn}/index/eventId-index"
+            - Effect: Allow
+              Action: [dynamodb:GetItem]
+              Resource: !GetAtt UsersTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt NotificationsTable.Arn
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: [ses:SendEmail]
+              Resource: '*'
+              Condition: { StringEquals: { ses:FromAddress: !Ref SesSenderEmail } }
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+              ArnLike: { aws:SourceArn: !GetAtt ScheduleGroup.Arn }
+      Policies:
+        - PolicyName: InvokeOnlyReminderFunction
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !GetAtt ReminderFunction.Arn
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Ref ScheduleGroupName
+  EventLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/eventpulse-events, RetentionInDays: 30 }
+  RegistrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/eventpulse-registrations, RetentionInDays: 30 }
+  UserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/eventpulse-users, RetentionInDays: 30 }
+  NotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/eventpulse-notifications, RetentionInDays: 30 }
+  ReminderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: /aws/lambda/eventpulse-reminders, RetentionInDays: 30 }
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EventPulse-Events
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: eventId, AttributeType: S }]
+      KeySchema: [{ AttributeName: eventId, KeyType: HASH }]
+  RegistrationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EventPulse-Registrations
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: registrationId, AttributeType: S }, { AttributeName: userId, AttributeType: S }, { AttributeName: eventId, AttributeType: S }]
+      KeySchema: [{ AttributeName: registrationId, KeyType: HASH }]
+      GlobalSecondaryIndexes:
+        - { IndexName: userId-index, KeySchema: [{ AttributeName: userId, KeyType: HASH }], Projection: { ProjectionType: ALL } }
+        - { IndexName: eventId-index, KeySchema: [{ AttributeName: eventId, KeyType: HASH }], Projection: { ProjectionType: ALL } }
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EventPulse-Users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: userId, AttributeType: S }]
+      KeySchema: [{ AttributeName: userId, KeyType: HASH }]
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EventPulse-Notifications
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: notificationId, AttributeType: S }, { AttributeName: userId, AttributeType: S }, { AttributeName: createdAt, AttributeType: S }]
+      KeySchema: [{ AttributeName: notificationId, KeyType: HASH }]
+      GlobalSecondaryIndexes:
+        - { IndexName: userId-createdAt-index, KeySchema: [{ AttributeName: userId, KeyType: HASH }, { AttributeName: createdAt, KeyType: RANGE }], Projection: { ProjectionType: ALL } }
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: EventPulse-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - { Name: email, Required: true, Mutable: true }
+        - { Name: name, Required: false, Mutable: true }
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: EventPulse-public-client
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: days }
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: ADMIN
+      Description: Administrators provisioned only by trusted operators.
+      UserPoolId: !Ref UserPool
+  SesConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: eventpulse-notifications
+  SesMetrics:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref SesConfigurationSet
+      EventDestination:
+        Name: CloudWatchNotificationMetrics
+        Enabled: true
+        MatchingEventTypes: [SEND, DELIVERY, BOUNCE, COMPLAINT, REJECT]
+        CloudWatchDestination:
+          DimensionConfigurations:
+            - DimensionName: EventType
+              DimensionValueSource: MESSAGE_TAG
+              DefaultDimensionValue: eventpulse
+Outputs:
+  ApiUrl: { Description: HTTP API base URL, Value: !Sub "https://${EventsApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}" }
+  CognitoUserPoolId: { Value: !Ref UserPool }
+  CognitoAppClientId: { Value: !Ref UserPoolClient }
+  SchedulerGroupName: { Value: !Ref ScheduleGroup }

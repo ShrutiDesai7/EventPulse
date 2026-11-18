@@ -1,0 +1,15 @@
+package com.eventpulse.service;
+import com.eventpulse.dto.*; import com.eventpulse.exception.*; import com.eventpulse.model.Event; import com.eventpulse.repository.EventRepository;
+import java.time.*; import java.util.*;
+public class EventService {
+ private final EventRepository repository; private final Clock clock;
+ public EventService(EventRepository r){this(r,Clock.systemUTC());} public EventService(EventRepository r,Clock c){repository=r;clock=c;}
+ public Event create(CreateEventRequest r,String user){validate(r.title(),r.category(),r.venue(),r.startDateTime(),r.endDateTime()); Event e=new Event(); e.setEventId(UUID.randomUUID().toString()); e.setTitle(r.title().trim()); e.setDescription(r.description()); e.setCategory(r.category().trim()); e.setVenue(r.venue().trim()); e.setStartDateTime(r.startDateTime()); e.setEndDateTime(r.endDateTime()); e.setCreatedBy(user); e.setCreatedAt(Instant.now(clock).toString()); e.setUpdatedAt(e.getCreatedAt()); e.setStatus(statusAt(e,clock.instant())); return repository.save(e); }
+ public Event get(String id){return repository.findById(id).map(e->withCurrentStatus(e,clock.instant())).orElseThrow(()->new EventNotFoundException(id));} public List<Event> list(){Instant now=clock.instant();return repository.findAll().stream().filter(e->!"CANCELLED".equals(e.getStatus())).map(e->withCurrentStatus(e,now)).toList();}
+ public Event update(String id,UpdateEventRequest r){Event e=get(id); if("CANCELLED".equals(e.getStatus()))throw new ValidationException("Cancelled events cannot be updated"); validate(r.title(),r.category(),r.venue(),r.startDateTime(),r.endDateTime()); e.setTitle(r.title().trim());e.setDescription(r.description());e.setCategory(r.category().trim());e.setVenue(r.venue().trim());e.setStartDateTime(r.startDateTime());e.setEndDateTime(r.endDateTime());e.setUpdatedAt(Instant.now(clock).toString()); return repository.save(e);}
+ public Event cancel(String id){Event e=get(id);e.setStatus("CANCELLED");e.setUpdatedAt(Instant.now(clock).toString());return repository.save(e);}
+ public static String statusAt(Event event,Instant now){if("CANCELLED".equals(event.getStatus()))return "CANCELLED";try{Instant start=Instant.parse(event.getStartDateTime()),end=Instant.parse(event.getEndDateTime());if(!end.isAfter(now))return "COMPLETED";return start.isAfter(now)?"UPCOMING":"ONGOING";}catch(RuntimeException missingOrInvalidDate){return event.getStatus()==null?"UPCOMING":event.getStatus();}}
+ private static Event withCurrentStatus(Event event,Instant now){event.setStatus(statusAt(event,now));return event;}
+ private void validate(String title,String category,String venue,String start,String end){if(blank(title)||blank(category)||blank(venue)||blank(start)||blank(end))throw new ValidationException("title, category, venue, startDateTime and endDateTime are required"); try{if(!Instant.parse(end).isAfter(Instant.parse(start)))throw new ValidationException("endDateTime must be after startDateTime");}catch(DateTimeException ex){throw new ValidationException("Dates must be ISO-8601 instants, for example 2027-03-01T10:00:00Z");}}
+ private boolean blank(String s){return s==null||s.isBlank();}
+}
